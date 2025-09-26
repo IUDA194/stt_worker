@@ -1,6 +1,13 @@
+from __future__ import annotations
+
 import asyncio
 import logging
+import os
+import shutil
+import subprocess
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import aioboto3
@@ -67,7 +74,7 @@ def s3_client():
         endpoint_url=settings.S3_ENDPOINT,
         aws_access_key_id=settings.S3_ACCESS_KEY,
         aws_secret_access_key=settings.S3_SECRET_KEY,
-        region_name=settings.S3_REGION,
+        region_name=getattr(settings, "S3_REGION", None),
         config=cfg,
     )
 
@@ -92,6 +99,90 @@ async def set_transcript(db: AsyncSession, job: STTJob, transcript: str) -> None
     job.transcribed_at = utcnow()
     job.status = JobStatus.TRANSCRIBED
     await db.commit()
+
+
+# ---------------------- Поддержка нормализации аудио ----------------------
+
+
+SUPPORTED_DIRECT_EXTS = {".ogg", ".wav", ".flac", ".webm"}  # можно слать как есть
+NEEDS_CONVERT_EXTS = {".mp3", ".m4a", ".aac", ".mp4", ".mka", ".oga"}  # лучше конвертить
+
+
+def _lower_ext(name: str) -> str:
+    try:
+        return Path(name).suffix.lower()
+    except Exception:
+        return ""
+
+
+async def _ensure_ffmpeg_available() -> None:
+    """Проверяет наличие ffmpeg, логирует подсказку если отсутствует."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-version",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning("ffmpeg seems unavailable (rc=%s). MP3/M4A may fail.", proc.returncode)
+    except FileNotFoundError:
+        logger.warning("ffmpeg not found in PATH. MP3/M4A won't be converted; ASR may fail.")
+
+
+async def convert_to_wav_16k_mono(src_bytes: bytes, src_name: str) -> tuple[bytes, str]:
+    """
+    Конвертирует произвольный аудио-байт-поток в WAV 16k mono с помощью ffmpeg.
+    Возвращает (dst_bytes, dst_filename).
+    """
+    await _ensure_ffmpeg_available()
+
+    tmpdir = tempfile.mkdtemp(prefix="stt_norm_")
+    in_path = os.path.join(tmpdir, os.path.basename(src_name))
+    out_path = os.path.join(tmpdir, "audio.wav")
+
+    try:
+        # пишем исходный контент
+        with open(in_path, "wb") as f:
+            f.write(src_bytes)
+
+        # ffmpeg -y -i in -ac 1 -ar 16000 out.wav
+        cmd = ["ffmpeg", "-y", "-i", in_path, "-ac", "1", "-ar", "16000", out_path]
+        # гоняем в отдельном потоке, чтобы не блокировать event loop
+        def _run():
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        await asyncio.to_thread(_run)
+
+        with open(out_path, "rb") as f:
+            out_bytes = f.read()
+
+        return out_bytes, "audio.wav"
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+async def maybe_normalize_audio(src_bytes: bytes, src_filename: str) -> tuple[bytes, str, bool]:
+    """
+    Возвращает (bytes, filename, converted) — если формат сомнительный (mp3/m4a/…),
+    конвертирует в WAV 16k mono. Иначе отдаёт как есть.
+    """
+    ext = _lower_ext(src_filename)
+    if ext in SUPPORTED_DIRECT_EXTS:
+        return src_bytes, src_filename, False
+    if ext in NEEDS_CONVERT_EXTS or not ext:
+        try:
+            dst_bytes, dst_name = await convert_to_wav_16k_mono(src_bytes, src_filename or "audio.bin")
+            return dst_bytes, dst_name, True
+        except Exception as e:
+            logger.warning("Audio normalization failed (%s). Will send original bytes: %s", src_filename, e)
+            # в крайнем случае шлём как есть
+            return src_bytes, src_filename or "audio.ogg", False
+    # дефолт: шлём как есть
+    return src_bytes, src_filename or "audio.ogg", False
 
 
 # ---------------------- Обработка задач ----------------------
@@ -197,18 +288,23 @@ async def process_job(
             filename = job.s3_key.split("/")[-1] or "audio.ogg"
             language = getattr(settings, "ASR_LANGUAGE", "ru")
             task = getattr(settings, "ASR_TASK", "transcribe")
-            timeout = getattr(settings, "ASR_TIMEOUT", 60.0)
+            timeout = float(getattr(settings, "ASR_TIMEOUT", 60.0))
+
+            # === Нормализация под ASR (фикс для mp3/m4a и т.п.) ===
+            norm_bytes, norm_name, converted = await maybe_normalize_audio(audio_bytes, filename)
+            if converted:
+                logger.info("Job %s: audio normalized to WAV 16k mono (%s -> %s)", job_id, filename, norm_name)
 
             logger.info(
-                "Job %s: sending audio to ASR (task=%s, language=%s, timeout=%s)",
+                "Job %s: sending audio to ASR (task=%s, language=%s, timeout=%.1f)",
                 job_id,
                 task,
                 language,
                 timeout,
             )
             transcript = await asr_client.transcribe(
-                audio_bytes,
-                filename=filename,
+                norm_bytes,
+                filename=norm_name,
                 language=language,
                 task=task,
                 timeout=timeout,
