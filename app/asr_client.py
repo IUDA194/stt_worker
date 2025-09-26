@@ -11,7 +11,7 @@ from app.config import settings
 __all__ = ["ASRClient", "transcribe"]
 
 
-DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0, read=50.0)
+DEFAULT_TIMEOUT = httpx.Timeout(3600.0, connect=10.0, read=50.0)
 _MAX_BODY_SNIPPET = 1024
 
 
@@ -49,6 +49,8 @@ class ASRClient:
         if isinstance(value, httpx.Timeout):
             return value
         if isinstance(value, (int, float)):
+            if value <= 0:
+                return httpx.Timeout(None)  # <= отключить все таймауты
             return httpx.Timeout(value)
         return DEFAULT_TIMEOUT
 

@@ -288,7 +288,7 @@ async def process_job(
             filename = job.s3_key.split("/")[-1] or "audio.ogg"
             language = getattr(settings, "ASR_LANGUAGE", "ru")
             task = getattr(settings, "ASR_TASK", "transcribe")
-            timeout = float(getattr(settings, "ASR_TIMEOUT", 60.0))
+            timeout = float(getattr(settings, "ASR_TIMEOUT", 6000.0))
 
             # === Нормализация под ASR (фикс для mp3/m4a и т.п.) ===
             norm_bytes, norm_name, converted = await maybe_normalize_audio(audio_bytes, filename)
