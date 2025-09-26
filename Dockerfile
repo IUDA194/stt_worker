@@ -2,13 +2,14 @@
 FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
 
-# curl, сертификаты, базовые шрифты, fontconfig, И ЭМОДЖИ
-# - fonts-dejavu-core: базовая латиница/кириллица
-# - fonts-symbola: монохромные emoji-глифы (если есть в репозитории)
-# - fontconfig: для fc-cache (обновить кеш шрифтов после ручной установки)
+# Базовые утилиты + шрифты + ffmpeg
+# - без рекомендованных зависимостей, максимально компактно
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates fontconfig fonts-dejavu-core fonts-symbola \
+    curl ca-certificates \
+    fontconfig fonts-dejavu-core fonts-symbola \
+    ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 # Установка uv
@@ -21,8 +22,9 @@ ENV PYTHONPATH=/app
 WORKDIR /app
 COPY . .
 
+# Устанавливаем зависимости проекта (poetry/requirements управляет uv через pyproject.toml/uv.lock)
 RUN uv sync --frozen
 
-# Запуск API
+# Запуск воркера
 CMD ["uv", "run", "main.py"]
 
