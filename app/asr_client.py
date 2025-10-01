@@ -18,7 +18,7 @@ __all__ = ["ASRClient", "transcribe"]
 logger = logging.getLogger(__name__)
 
 # ===== HTTP/таймауты =====
-DEFAULT_CLIENT_TIMEOUT = httpx.Timeout(3600.0, connect=10.0, read=60.0)
+DEFAULT_CLIENT_TIMEOUT = httpx.Timeout(3600.0, connect=10.0, write=6000.0, read=60.0)
 _MAX_BODY_SNIPPET = 2048  # используется только когда полное логирование отключено
 
 # ===== Опрос операции =====
