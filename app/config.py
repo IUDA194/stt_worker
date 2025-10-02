@@ -32,8 +32,8 @@ class Settings(BaseSettings):
     # === ASR: Асинхронный API (v3) ===
     # Обычно всё доступно через https://stt.api.cloud.yandex.net
     ASR_LONG_BASE_URL: str = "https://stt.api.cloud.yandex.net"
-    ASR_LONG_START_ENDPOINT: str = "speechkit/v3/recognizeFile"
-    ASR_LONG_OPS_ENDPOINT: str = "operations"
+    ASR_LONG_START_ENDPOINT: str = "stt/v3/recognizeFileAsync"
+    ASR_LONG_OPS_ENDPOINT: str = "stt/v3/getRecognition"
 
     # === Авторизация в SpeechKit ===
     SPEECHKIT_API_KEY: str | None = None           # либо Api-Key

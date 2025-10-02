@@ -219,6 +219,11 @@ class ASRClient:
         content_type: str = "audio/ogg",
         language: Optional[str] = None,
     ) -> str:
+        # Для большого base64 тело может парситься/валидироваться дольше 60с.
+        # Дадим старту более мягкий read-timeout и один ретрай на ReadTimeout.
+        start_timeout = httpx.Timeout(3600.0, connect=10.0, write=6000.0, read=300.0)
+        start_attempts = 2
+
         headers = self._auth_headers()
         headers["Content-Type"] = "application/json"
         params = self._common_params()
@@ -245,22 +250,49 @@ class ASRClient:
             },
         }
 
-        resp = await self._http_post(self._start_url, headers=headers, params=params, json=payload)
+        last_exc: Optional[Exception] = None
+        for i in range(1, start_attempts + 1):
+            try:
+                resp = await self._http_post(
+                    self._start_url,
+                    headers=headers,
+                    params=params,
+                    json=payload,
+                    timeout=start_timeout,  # перезаписываем client timeout только для этого запроса
+                )
+                break
+            except httpx.ReadTimeout as e:
+                last_exc = e
+                if i < start_attempts:
+                    logger.warning("ASR start_by_bytes ReadTimeout, retrying (%d/%d)…", i + 1, start_attempts)
+                    await asyncio.sleep(1.0 * i)
+                    continue
+                raise
+
         body = resp.text
         if resp.status_code >= 300:
             if ASR_LOG_FULL_BODIES:
-                logger.warning("ASR start_by_bytes failed: HTTP %s body_len=%d body=%r", resp.status_code, len(body), body)
+                logger.warning(
+                    "ASR start_by_bytes failed: HTTP %s body_len=%d body=%r",
+                    resp.status_code,
+                    len(body or ""),
+                    body,
+                )
             else:
-                logger.warning("ASR start_by_bytes failed: HTTP %s body_tail=%r", resp.status_code, _tail(body, _MAX_BODY_SNIPPET))
+                logger.warning(
+                    "ASR start_by_bytes failed: HTTP %s body_tail=%r",
+                    resp.status_code,
+                    _tail(body or "", _MAX_BODY_SNIPPET),
+                )
             raise RuntimeError(f"ASR start_by_bytes failed: {resp.status_code}")
 
         data = resp.json()
         op_id = data.get("operationId") or data.get("id") or data.get("name")
         if not op_id:
             if ASR_LOG_FULL_BODIES:
-                logger.error("ASR start_by_bytes: cannot extract operation id. body_len=%d body=%r", len(body), body)
+                logger.error("ASR start_by_bytes: cannot extract operation id. body_len=%d body=%r", len(body or ""), body)
             else:
-                logger.error("ASR start_by_bytes: cannot extract operation id. body_tail=%r", _tail(body, _MAX_BODY_SNIPPET))
+                logger.error("ASR start_by_bytes: cannot extract operation id. body_tail=%r", _tail(body or "", _MAX_BODY_SNIPPET))
             raise RuntimeError("Cannot extract operation id")
 
         initial_wait = float(getattr(settings, "ASR_LONG_INITIAL_WAIT_SEC", DEFAULT_INITIAL_WAIT_SEC))
@@ -323,13 +355,15 @@ class ASRClient:
             elif resp.status_code >= 300:
                 logger.warning("ASR poll %s: HTTP %s (see previous body log)", operation_id, resp.status_code)
             else:
-                if "application/json" in ctype:
+                # Унифицированный парсинг NDJSON/JSON
+                objs = _iter_ndjson(body)
+                if not objs:
                     try:
-                        objs: List[dict] = [resp.json()]
-                    except ValueError:
-                        objs = _iter_ndjson(body)
-                else:
-                    objs = _iter_ndjson(body)
+                        one = resp.json()
+                        if isinstance(one, dict):
+                            objs = [one]
+                    except Exception:
+                        objs = []
 
                 for obj in objs:
                     carrier = obj.get("result") if isinstance(obj.get("result"), dict) else obj
@@ -416,11 +450,15 @@ class ASRClient:
                     message = status_code.get("message") if isinstance(status_code, dict) else None
                     if isinstance(message, str) and message.upper().startswith("COMPLETED"):
                         completed = True
+                    # альтернативные признаки завершения
+                    if not completed and str(carrier.get("done", "")).lower() in {"true", "1"}:
+                        completed = True
 
             # Эвристика авто-завершения: если eou>=received и опросы повторяют одно и то же
             progress_key = (rec_ms, eou_ms, fin_ms, par_ms, fi_cur, tuple(sorted(segments.items())))
             if not completed:
-                if last_progress_key == progress_key and eou_ms >= rec_ms and len(segments) > 0:
+                stable_final_idx = (fi_cur is not None) and (last_progress_key is not None) and (last_progress_key[4] == fi_cur)
+                if last_progress_key == progress_key and eou_ms >= rec_ms and (len(segments) > 0 or stable_final_idx):
                     idle_polls += 1
                 else:
                     idle_polls = 0
@@ -428,8 +466,8 @@ class ASRClient:
 
                 if idle_polls >= ASR_AUTO_FINALIZE_POLL_LIMIT:
                     logger.info(
-                        "ASR operation %s: auto-finalize after idle=%d polls (eou=%dms, received=%dms, seg=%d)",
-                        operation_id, idle_polls, eou_ms, rec_ms, len(segments)
+                        "ASR operation %s: auto-finalize after idle=%d polls (eou=%dms, received=%dms, seg=%d, finalIndex=%s)",
+                        operation_id, idle_polls, eou_ms, rec_ms, len(segments), fi_cur
                     )
                     completed = True
 

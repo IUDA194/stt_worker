@@ -105,7 +105,7 @@ async def set_transcript(db: AsyncSession, job: STTJob, transcript: str) -> None
 
 
 SUPPORTED_DIRECT_EXTS = {".ogg", ".wav", ".flac", ".webm"}  # можно слать как есть
-NEEDS_CONVERT_EXTS = {".mp3", ".m4a", ".aac", ".mp4", ".mka", ".oga"}  # лучше конвертить
+NEEDS_CONVERT_EXTS = {".mp3", ".m4a", ".aac", ".mp4", ".mka", ".oga"}  # раньше конвертили в WAV
 
 
 def _lower_ext(name: str) -> str:
@@ -125,15 +125,14 @@ async def _ensure_ffmpeg_available() -> None:
         )
         await proc.communicate()
         if proc.returncode != 0:
-            logger.warning("ffmpeg seems unavailable (rc=%s). MP3/M4A may fail.", proc.returncode)
+            logger.warning("ffmpeg seems unavailable (rc=%s). Audio conversion may fail.", proc.returncode)
     except FileNotFoundError:
-        logger.warning("ffmpeg not found in PATH. MP3/M4A won't be converted; ASR may fail.")
+        logger.warning("ffmpeg not found in PATH. Audio conversion may fail.")
 
 
 async def convert_to_wav_16k_mono(src_bytes: bytes, src_name: str) -> tuple[bytes, str]:
     """
-    Конвертирует произвольный аудио-байт-поток в WAV 16k mono с помощью ffmpeg.
-    Возвращает (dst_bytes, dst_filename).
+    (Старая версия) Конвертирует в WAV 16k mono — ОСТАВЛЕНО для совместимости, но больше не используется по умолчанию.
     """
     await _ensure_ffmpeg_available()
 
@@ -142,13 +141,11 @@ async def convert_to_wav_16k_mono(src_bytes: bytes, src_name: str) -> tuple[byte
     out_path = os.path.join(tmpdir, "audio.wav")
 
     try:
-        # пишем исходный контент
         with open(in_path, "wb") as f:
             f.write(src_bytes)
 
-        # ffmpeg -y -i in -ac 1 -ar 16000 out.wav
         cmd = ["ffmpeg", "-y", "-i", in_path, "-ac", "1", "-ar", "16000", out_path]
-        # гоняем в отдельном потоке, чтобы не блокировать event loop
+
         def _run():
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -165,10 +162,52 @@ async def convert_to_wav_16k_mono(src_bytes: bytes, src_name: str) -> tuple[byte
             pass
 
 
+async def convert_to_ogg_opus(src_bytes: bytes, src_name: str, bitrate: str = "48k") -> tuple[bytes, str]:
+    """
+    Новая нормализация по умолчанию:
+    Конвертирует произвольный аудио-байт-поток в OGG/Opus (моно, VBR, заданный битрейт).
+    На выходе значительно меньше размер (обычно 3–6 МБ вместо десятков).
+    """
+    await _ensure_ffmpeg_available()
+
+    tmpdir = tempfile.mkdtemp(prefix="stt_norm_")
+    in_path = os.path.join(tmpdir, os.path.basename(src_name))
+    out_path = os.path.join(tmpdir, "audio.ogg")
+
+    try:
+        with open(in_path, "wb") as f:
+            f.write(src_bytes)
+
+        # Преобразование в Opus mono, VBR; ffmpeg сам подберёт частоту дискретизации
+        cmd = [
+            "ffmpeg", "-y", "-i", in_path,
+            "-ac", "1",                    # моно
+            "-c:a", "libopus",
+            "-b:a", bitrate,               # например, 48k
+            "-vbr", "on",
+            out_path,
+        ]
+
+        def _run():
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        await asyncio.to_thread(_run)
+
+        with open(out_path, "rb") as f:
+            out_bytes = f.read()
+
+        return out_bytes, "audio.ogg"
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 async def maybe_normalize_audio(src_bytes: bytes, src_filename: str) -> tuple[bytes, str, bool]:
     """
-    Возвращает (bytes, filename, converted) — если формат сомнительный (mp3/m4a/…),
-    конвертирует в WAV 16k mono. Иначе отдаёт как есть.
+    (Старая стратегия) — оставлено для обратной совместимости: конвертация в WAV.
+    Теперь по умолчанию используем convert_to_ogg_opus() в process_job().
     """
     ext = _lower_ext(src_filename)
     if ext in SUPPORTED_DIRECT_EXTS:
@@ -178,10 +217,8 @@ async def maybe_normalize_audio(src_bytes: bytes, src_filename: str) -> tuple[by
             dst_bytes, dst_name = await convert_to_wav_16k_mono(src_bytes, src_filename or "audio.bin")
             return dst_bytes, dst_name, True
         except Exception as e:
-            logger.warning("Audio normalization failed (%s). Will send original bytes: %s", src_filename, e)
-            # в крайнем случае шлём как есть
+            logger.warning("Audio normalization (WAV) failed (%s). Will send original bytes: %s", src_filename, e)
             return src_bytes, src_filename or "audio.ogg", False
-    # дефолт: шлём как есть
     return src_bytes, src_filename or "audio.ogg", False
 
 
@@ -220,7 +257,6 @@ def _resolve_notion(notion: Optional[Any]):
         return None
 
     try:
-        # Передаём флаг debug в uploader, чтобы он ещё детальнее логировал HTTP.
         return NotionUploader(token=token, root_page_id=root_page_id, debug=debug)
     except Exception as e:
         logger.warning("Notion uploader init failed: %s", e)
@@ -290,10 +326,22 @@ async def process_job(
             task = getattr(settings, "ASR_TASK", "transcribe")
             timeout = float(getattr(settings, "ASR_TIMEOUT", 6000.0))
 
-            # === Нормализация под ASR (фикс для mp3/m4a и т.п.) ===
-            norm_bytes, norm_name, converted = await maybe_normalize_audio(audio_bytes, filename)
-            if converted:
-                logger.info("Job %s: audio normalized to WAV 16k mono (%s -> %s)", job_id, filename, norm_name)
+            # === Новая нормализация: OGG/Opus (моно, VBR, ~48k) ===
+            opus_bytes, opus_name = await convert_to_ogg_opus(audio_bytes, filename, bitrate="48k")
+            # Лог размера после конвертации для контроля выигрыша
+            try:
+                logger.info(
+                    "Job %s: audio normalized to OGG Opus (%.2f → %.2f MB) (%s -> %s)",
+                    job_id,
+                    len(audio_bytes) / (1024 * 1024),
+                    len(opus_bytes) / (1024 * 1024),
+                    filename,
+                    opus_name,
+                )
+            except Exception:
+                logger.info("Job %s: audio normalized to OGG Opus (%s -> %s)", job_id, filename, opus_name)
+
+            content_type = "audio/ogg"
 
             logger.info(
                 "Job %s: sending audio to ASR (task=%s, language=%s, timeout=%.1f)",
@@ -303,11 +351,12 @@ async def process_job(
                 timeout,
             )
             transcript = await asr_client.transcribe(
-                norm_bytes,
-                filename=norm_name,
+                opus_bytes,
+                filename=opus_name,
                 language=language,
                 task=task,
                 timeout=timeout,
+                content_type=content_type,  # ВАЖНО: правильный content-type
             )
             logger.info("Job %s: transcription received (%d chars)", job_id, len(transcript))
 
